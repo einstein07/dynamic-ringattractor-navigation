@@ -1,0 +1,12 @@
+{
+    "id": "ringattractor",
+    "guard_id": "osoyoo_1",
+    "target_id": "osoyoo_2",
+    "corner1": [-101.0, 101.0],
+    "corner2": [-199.0, 199.0],
+    "update_time": 0.05,
+    "minimal_dist": 400,
+    "away_scale": 0.8,
+    "angular_speed": 190,
+    "rotate_scale": 1.0
+}
