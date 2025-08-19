@@ -19,7 +19,7 @@ def generate_launch_description():
         # Start control.py node
         Node(
             package='ringattractor',
-            executable='control',
+            executable='ringattractor',
             name='ringattractor',
             output='screen',
             arguments=[LaunchConfiguration('param_file')]
