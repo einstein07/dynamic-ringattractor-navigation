@@ -130,9 +130,9 @@ class RingAttractorModel():
         # Number of targets (e.g., blobs) to track
         self.num_targets = num_targets
         # Quality of targets (e.g., blob detection confidence)
-        self.target_quality = np.array(target_quality)
+        self.target_quality = np.array([target_quality])
         # Quality of guards (e.g., negative influence)
-        self.guard_quality = np.array(guard_quality)
+        self.guard_quality = np.array([guard_quality])
         # Concentration (inverse of variance) for von Mises
         self.kappa = kappa
         # # Shape parameter v for the interaction kernel
