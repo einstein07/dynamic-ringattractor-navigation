@@ -221,7 +221,8 @@ class RingAttractorModel():
     def dynamics(self, t, y, u, b, M, beta, n, sigma):
         """ Computes the dynamics of the ring attractor model."""
         # Noise vector (same shape as y)
-        noise = (sigma / n) * np.random.randn(*y.shape)
+        #noise = (sigma / n) * np.random.randn(*y.shape)
+        noise = np.random.normal(0, sigma, size=y.shape) / np.sqrt(n)  # Scale noise by sqrt(n)
         
         # Dynamics for z
         return -y + np.tanh(u * M @ y + b - beta) - np.tanh(-beta) + noise 
