@@ -278,7 +278,10 @@ class RingAttractorModel():
             
             guard_angles = None
             guard_agent_dist = None
+            target_angles = None
+
             if opt.guard_id in pos_message and 'self' in pos_message:
+                """ Compute guard angles and distance to guard if available """
 
                 guard_agent_dist = math.sqrt( (pos_message[opt.guard_id][0] - pos_message['self'][0]) ** 2 \
                                     + (pos_message[opt.guard_id][1] - pos_message['self'][1]) ** 2 )
@@ -290,22 +293,25 @@ class RingAttractorModel():
                 )
 
                 guard_angles = np.array([angle_to_guard])  # shape (1,)
-                
-            else:
-                print(f"Warning: {opt.guard_id} or 'self' missing from pos_message: {pos_message.keys()}")
 
-            target_angles = None
-            if opt.target_id in pos_message and 'self' in pos_message:
+                """ Compute target angles if available """
                 angle_to_target = angle_to_guard_egocentric(
                         (pos_message['self'][0], pos_message['self'][1]),
                         pos_message['self'][2],
                         (pos_message[opt.target_id][0], pos_message[opt.target_id][1])
                 )
             
-                target_angles = np.array([angle_to_target])  # shape (1,) 
+                target_angles = np.array([angle_to_target])  # shape (1,)
+                
             else:
-                print(f"Warning: {opt.guard_id} or 'self' missing from pos_message: {pos_message.keys()}")
-                target_angles = np.array([0.0])  # Default to 0 if no target
+                if opt.target_id not in pos_message:
+                    print(f"Warning: {opt.guard_id} missing from pos_message: {pos_message.keys()}")
+                    target_angles = np.array([0.0])  # Default to 0 if no target
+                if 'self' not in pos_message:
+                    print(f"Warning: 'self' missing from pos_message: {pos_message.keys()}")
+
+            
+                
 
             # Compute sensory input vector b
             self.compute_sensory_map(
@@ -377,17 +383,11 @@ class ViconSubscriber(Node):
                 if msg.positions[i].subject_name == self.id:
                     # Update the current position with the received data
                     self.current_position = msg.positions[i]
-                    pos_message_g['self'] = (float(msg.positions[i].x_trans), float(msg.positions[i].y_trans), float(quaternion_to_yaw(
-                        msg.positions[i].w, 
-                        msg.positions[i].x_rot, 
-                        msg.positions[i].y_rot, 
-                        msg.positions[i].z_rot)))
+                    pos_message_g['self'] = (float(msg.positions[i].x_trans), float(msg.positions[i].y_trans), 
+                                             float( msg.positions[i].z_rot_euler))
                 else:
-                    pos_message_g[msg.positions[i].subject_name] = (float(msg.positions[i].x_trans), float(msg.positions[i].y_trans), float(quaternion_to_yaw(
-                        msg.positions[i].w, 
-                        msg.positions[i].x_rot, 
-                        msg.positions[i].y_rot, 
-                        msg.positions[i].z_rot)))
+                    pos_message_g[msg.positions[i].subject_name] = (float(msg.positions[i].x_trans), float(msg.positions[i].y_trans), 
+                                                                    float(msg.positions[i].z_rot_euler))
                 
                 #self.get_logger().info('subject "%s" with segment %s:' %(msg.positions[i].subject_name, msg.positions[i].segment_name))
                 #self.get_logger().info('I heard translation in x, y, z: "%f", "%f", "%f"' % (msg.positions[i].x_trans, msg.positions[i].y_trans, msg.positions[i].z_trans))
