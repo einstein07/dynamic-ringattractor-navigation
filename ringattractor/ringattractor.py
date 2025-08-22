@@ -242,7 +242,7 @@ class RingAttractorModel():
             method='DOP853',       # use faster method
             rtol=1e-2,             # relax tolerance for speed
             atol=1e-4,  
-            vectorized=True # Enable vectorization for efficiency
+            vectorized=False # Enable vectorization for efficiency
         )
         
         self.neural_field = result.y.T  # Final state
