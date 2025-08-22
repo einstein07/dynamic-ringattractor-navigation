@@ -223,7 +223,7 @@ class RingAttractorModel():
         #noise = (sigma / n) * np.random.randn(*y.shape)
         noise = np.random.normal(0, sigma, size=y.shape) / np.sqrt(n)  # Scale noise by sqrt(n)
         dydt = -y + np.tanh(u * M @ y + b - beta) - np.tanh(-beta) + noise 
-        print("y.shape:", y.shape, "dydt.shape:", dydt.shape)
+        #print("y.shape:", y.shape, "dydt.shape:", dydt.shape)
         # Dynamics for z
         return dydt
         
@@ -473,7 +473,7 @@ def move_forward():
     v_lin = 200.0  # Constant linear velocity (m/s)
     v_ang = 0.0  # No rotation
     max_motor_speed = 4095  # Max PWM value
-    move_duration = 1.0  # Move forward for 2 seconds
+    move_duration = 2.0  # Move forward for 2 seconds
 
     # Calculate motor speeds
     v_left, v_right = calculate_speed(v_lin, v_ang)
