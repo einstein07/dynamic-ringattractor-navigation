@@ -271,16 +271,17 @@ class RingAttractorModel():
         global target_heading
         global perform_turn
         pos_message = {}
-        # Copy the global position message to local variable
-        with pos_lock:
-            pos_message = pos_message_g.copy()
+
         while self.running:
+            # Copy the global position message to local variable
+            with pos_lock:
+                pos_message = pos_message_g.copy()
             
             guard_angles = None
             guard_agent_dist = None
             target_angles = None
 
-            if opt.guard_id in pos_message and 'self' in pos_message:
+            if opt.target_id in pos_message and opt.guard_id in pos_message and 'self' in pos_message:
                 print(f"pos_message: {pos_message.keys()}", flush=True)
 
                 """ Compute guard angles and distance to guard if available """
@@ -311,10 +312,14 @@ class RingAttractorModel():
                     target_angles = np.array([0.0])  # Default to 0 if no target
                 if 'self' not in pos_message:
                     print(f"Warning: 'self' missing from pos_message: {pos_message.keys()}", flush=True)
+                if opt.guard_id not in pos_message:
+                    print(f"Warning: {opt.guard_id} missing from pos_message: {pos_message.keys()}", flush=True)
 
             
                 
 
+            if target_angles is None:
+                target_angles = np.array([0.0])  # Default to 0 if no target, should not happen
             # Compute sensory input vector b
             self.compute_sensory_map(
                 target_positions=target_angles,
@@ -377,20 +382,25 @@ class ViconSubscriber(Node):
             self.listener_callback,
             10)
 
+        self.pose_received = threading.Event()
+
+
     def listener_callback(self, msg):
         with pos_lock:
             global pos_message_g 
             pos_message_g= {}
-            for i in range(msg.n):
-                if msg.positions[i].subject_name == self.id:
-                    # Update the current position with the received data
-                    self.current_position = msg.positions[i]
+        for i in range(msg.n):
+            if msg.positions[i].subject_name == self.id:
+                # Update the current position with the received data
+                with pos_lock:
                     pos_message_g['self'] = (float(msg.positions[i].x_trans), float(msg.positions[i].y_trans), 
-                                             float( msg.positions[i].z_rot_euler))
-                else:
+                                            float( msg.positions[i].z_rot_euler))
+            else:
+                with pos_lock:
                     pos_message_g[msg.positions[i].subject_name] = (float(msg.positions[i].x_trans), float(msg.positions[i].y_trans), 
-                                                                    float(msg.positions[i].z_rot_euler))
-                
+                                                                float(msg.positions[i].z_rot_euler))
+        # Signal that at least one pose has been received
+        self.pose_received.set()
                 #self.get_logger().info('subject "%s" with segment %s:' %(msg.positions[i].subject_name, msg.positions[i].segment_name))
                 #self.get_logger().info('I heard translation in x, y, z: "%f", "%f", "%f"' % (msg.positions[i].x_trans, msg.positions[i].y_trans, msg.positions[i].z_trans))
                 #self.get_logger().info('I heard rotation in x, y, z, w: "%f", "%f", "%f", "%f": ' % (msg.positions[i].x_rot, msg.positions[i].y_rot, msg.positions[i].z_rot, msg.positions[i].w))
@@ -534,29 +544,43 @@ def robot_motion():
         GPIO.cleanup()
 
 def main():
-    # Initialize ring attractor
-    ring_attractor = RingAttractorModel(num_targets=1)
-    
     rclpy.init()
     vicon_node = ViconSubscriber()
 
-    # start other workers
+    # Use a multi-threaded executor
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(vicon_node)
+
+    # Start executor in a background thread
+    exec_thread = threading.Thread(target=executor.spin, daemon=True)
+    exec_thread.start()
+    print("ViconSubscriber spinning...", flush=True)
+
+    # Wait until we have received at least one pose
+    print("Waiting for first Vicon pose...", flush=True)
+    vicon_node.pose_received.wait()   # blocks until first pose callback
+    print("Pose received, starting control threads!", flush=True)
+
+    # Now start your other threads
+    ring_attractor = RingAttractorModel(num_targets=1)
     ring_thread = threading.Thread(target=ring_attractor.run, daemon=True)
     motion_thread = threading.Thread(target=robot_motion, daemon=True)
+
     ring_thread.start()
     motion_thread.start()
 
     try:
-        # spin blocks main thread until shutdown
-        rclpy.spin(vicon_node)
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         print("Shutting down")
         ring_attractor.stop()
     finally:
-        vicon_node.destroy_node()
-        rclpy.shutdown()
         stopcar()
         GPIO.cleanup()
+        executor.shutdown()
+        vicon_node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
