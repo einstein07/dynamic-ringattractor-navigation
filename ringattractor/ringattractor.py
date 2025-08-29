@@ -1,6 +1,7 @@
 """ROS2 IMPORTS"""
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
 from turtlesim.msg import Pose
 from vicon_receiver.msg import Position # Ensure you haave the corresponding package for this custom message type
 from vicon_receiver.msg import PositionList # Ensure you haave the corresponding package for this custom message type
@@ -9,6 +10,7 @@ from ament_index_python.packages import get_package_share_directory
 """Robot actuation imports"""
 import RPi.GPIO as GPIO
 import Adafruit_PCA9685
+import signal
 
 """Standard imports"""
 import time
@@ -26,6 +28,9 @@ from scipy.integrate import solve_ivp
 import os
 import csv
 import cv2
+
+from simple_pid import PID
+from numba import njit
 
 # Initialize motor control
 pwm = Adafruit_PCA9685.PCA9685()
@@ -91,7 +96,7 @@ def angle_to_guard_egocentric(agent_pos, agent_heading, guard_pos):
     ax, ay = agent_pos
     gx, gy = guard_pos
     angle_global = np.arctan2(gy - ay, gx - ax)
-    return wrap_angle(angle_global - agent_heading)
+    return wrap_angle(angle_global)
 
 #======================define parameters=============================
 package_name = 'ringattractor'
@@ -123,7 +128,7 @@ opt = Options()
 #====================== Ring Attractor Model ======================
 
 class RingAttractorModel():
-    def __init__(self, num_neurons=100, num_targets=1, target_quality=1.0, guard_quality=-15.0, kappa=20.0, v=0.5, u=1.0, beta=1.0, spatial_decay=2.0, sigma=0.01, update_interval=1.0):
+    def __init__(self, num_neurons=100, num_targets=1, target_quality=1.0, guard_quality=-15.0, kappa=20.0, v=0.5, u=6.0, beta=1.0, spatial_decay=2.0, sigma=0.01, update_interval=1.0):
         # Number of neurons in the ring attractor
         self.num_neurons = num_neurons
         # Number of targets (e.g., blobs) to track
@@ -162,8 +167,14 @@ class RingAttractorModel():
         # Initialize neural activation log
         self.neural_log = []  # Each entry: [timestamp, val1, val2, ..., valN]
 
+        # Initialilize sensory map logging
+        self.sensory_log = []  # Each entry: [timestamp, val1, val2, ..., valN]
+
+        self.position_log = []  # Each entry: [timestamp, x, y, heading]
+
         # Optional: Publisher for bump CoM
         #self.field_pub = self.create_publisher(Float64MultiArray, 'neural_field', 10)
+        self.output_received = threading.Event()
 
     
     def compute_sensory_map(self, target_positions, target_qualities, theta_i, kappa, 
@@ -171,32 +182,36 @@ class RingAttractorModel():
         """
         Computes the sensory input vector b (vectorised).
         """
-        n = len(theta_i)
-
         # --- Contribution from targets ---
-        # Shape: (n, k)
-        delta_targets = theta_i[:, None] - target_positions[None, :]
-        delta_targets = (delta_targets + np.pi) % (2*np.pi) - np.pi  # wrap
-        vm_targets = np.exp(kappa * (np.cos(delta_targets) - 1))     # (n, k)
+        delta_matrix = delta_angle(self.theta_i[:, np.newaxis], target_positions[np.newaxis, :])  # shape: (num_neurons, num_targets)
+        #print('delta_matrix: ', delta_matrix.shape, flush=True)
+        vm_targets = np.exp(kappa * (np.cos(delta_matrix) - 1))     # (num_neurons, num_targets)
+        #print('vm_targets: ', vm_targets.shape, flush=True)
 
         # Weighted sum over targets
-        b = vm_targets @ target_qualities   # (n,)
-
+        self.b = vm_targets @ target_qualities   # (num_neurons,)
+        #print('vm_targets @ target_qualities: ', self.b.shape, flush=True)
         # --- Inhibition from guards ---
         if guard_angles is not None and guard_qualities is not None and r is not None and d is not None:
-            # Shape: (n, m)
-            delta_guards = theta_i[:, None] - guard_angles[None, :]
-            delta_guards = np.abs((delta_guards + np.pi) % (2*np.pi) - np.pi)  # wrap & abs
-            vm_guards = np.exp(kappa * (np.cos(delta_guards) - 1))             # (n, m)
-
+            delta_guards = delta_angle(self.theta_i[:, np.newaxis], guard_angles[np.newaxis, :])  # shape: (num_neurons, num_guards)  # wrap & abs
+            #print('delta_guards: ', delta_guards.shape, flush=True)
+            vm_guards = np.exp(kappa * (np.cos(delta_guards) - 1))             # (num_neurons, num_guards)
+            #print('vm_guards: ', vm_guards.shape, flush=True)    
             # Each guard contributes -gamma * exp(-r*d)
-            s_guards = -np.array(guard_qualities) * np.exp(-r * d)                # (m,)
+            #print('r, d: ', r, d, flush=True)
+            s_guards = guard_qualities * np.exp(-r * d)                # (num_guards,)
+            #print('s_guards: ', s_guards, flush=True)
+            # Weighted sum over guards
+            weighted_sum = vm_guards @ s_guards
+            #print('vm_guards @ s_guards: ', weighted_sum.shape, flush=True)
+            self.b += weighted_sum   # (num_neurons,)
+            #print('b after guards: ', self.b.shape, flush=True)
 
-            b += vm_guards @ s_guards   # (n,)
-
+            
         # --- Normalization ---
-        b /= np.sqrt(n)
-        return b
+        self.b /= np.sqrt(self.num_neurons)
+        #print('Final b: ', self.b.shape, flush=True)
+        #return b
     
     def compute_interaction_kernel(self):
         """
@@ -216,12 +231,14 @@ class RingAttractorModel():
         return ((1 / self.num_neurons) * np.cos(np.pi * (delta_ij / np.pi) ** self.v))
 
         
-
-    def dynamics(self, t, y, u, b, M, beta, n, sigma):
+    @staticmethod
+    @njit
+    def dynamics(t, y, u, b, M, beta, n, sigma):
         """ Computes the dynamics of the ring attractor model."""
         # Noise vector (same shape as y)
         #noise = (sigma / n) * np.random.randn(*y.shape)
         noise = np.random.normal(0, sigma, size=y.shape) / np.sqrt(n)  # Scale noise by sqrt(n)
+
         dydt = -y + np.tanh(u * M @ y + b - beta) - np.tanh(-beta) + noise 
         #print("y.shape:", y.shape, "dydt.shape:", dydt.shape)
         # Dynamics for z
@@ -235,11 +252,11 @@ class RingAttractorModel():
         y0 = np.random.randn(self.num_neurons) * 0.1
         
         result = solve_ivp(
-            fun=lambda t, y: self.dynamics(t, y, self.u, self.b, self.M, self.beta, self.num_neurons, self.sigma),
+            fun=lambda t, y: RingAttractorModel.dynamics(t, y, self.u, self.b, self.M, self.beta, self.num_neurons, self.sigma),
             t_span=(0, total_time),
             y0=y0,
             t_eval=t_eval,
-            method='DOP853',       # use faster method
+            method='RK45',       # use faster method
             rtol=1e-2,             # relax tolerance for speed
             atol=1e-4,  
             vectorized=False # Enable vectorization for efficiency
@@ -254,13 +271,29 @@ class RingAttractorModel():
         final_norm = np.linalg.norm(self.neural_field[-1])
         return times, bump_positions, final_norm
 
-    def save_log(self):
-        log_path = os.path.expanduser("~/neural_activation_log.csv")
+    def save_ring_log(self):
+        log_path = os.path.expanduser("~/neural_activation_log_stationary.csv")
         with open(log_path, "w", newline="") as f:
             writer = csv.writer(f)
-            header = ["time"] + [f"bump_positions"] + [f"neuron_{i}" for i in range(self.num_neurons)]
+            header = ["target"] + ["guard"] + [f"bump_positions"] + [f"neuron_{i}" for i in range(self.num_neurons)]
             writer.writerow(header)
             writer.writerows(self.neural_log)
+
+    def save_sensory_log(self):
+        log_path = os.path.expanduser("~/sensory_map_log_stationary.csv")
+        with open(log_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            header = ["target"] + [f"neuron_{i}" for i in range(self.num_neurons)]
+            writer.writerow(header)
+            writer.writerows(self.sensory_log)
+
+    def save_position_log(self):
+        log_path = os.path.expanduser("~/position_log_stationary.csv")
+        with open(log_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            header = ["x"] + ["y"] + ["heading"] + ["x_target"] + ["y_target"] + ["heading_target"]
+            writer.writerow(header)
+            writer.writerows(self.position_log)
 
     def run(self):
         """
@@ -281,21 +314,22 @@ class RingAttractorModel():
             guard_agent_dist = None
             target_angles = None
 
-            if opt.target_id in pos_message and opt.guard_id in pos_message and 'self' in pos_message:
-                print(f"pos_message: {pos_message.keys()}", flush=True)
+            if opt.target_id in pos_message and 'self' in pos_message:
+                #print(f"pos_message: {pos_message.keys()}", flush=True)
 
                 """ Compute guard angles and distance to guard if available """
+                if opt.guard_id in pos_message:
+                    guard_agent_dist = math.sqrt( (pos_message[opt.guard_id][0] - pos_message['self'][0]) ** 2 \
+                                        + (pos_message[opt.guard_id][1] - pos_message['self'][1]) ** 2 )
+                    guard_agent_dist /= 1000.0  # convert to meters
+                    
+                    angle_to_guard = angle_to_guard_egocentric(
+                        (pos_message['self'][0], pos_message['self'][1]),
+                        pos_message['self'][2],
+                        (pos_message[opt.guard_id][0], pos_message[opt.guard_id][1])
+                    )
 
-                guard_agent_dist = math.sqrt( (pos_message[opt.guard_id][0] - pos_message['self'][0]) ** 2 \
-                                    + (pos_message[opt.guard_id][1] - pos_message['self'][1]) ** 2 )
-                
-                angle_to_guard = angle_to_guard_egocentric(
-                    (pos_message['self'][0], pos_message['self'][1]),
-                    pos_message['self'][2],
-                    (pos_message[opt.guard_id][0], pos_message[opt.guard_id][1])
-                )
-
-                guard_angles = np.array([angle_to_guard])  # shape (1,)
+                    guard_angles = np.array([angle_to_guard])  # shape (1,)
 
                 """ Compute target angles if available """
                 angle_to_target = angle_to_guard_egocentric(
@@ -312,8 +346,8 @@ class RingAttractorModel():
                     target_angles = np.array([0.0])  # Default to 0 if no target
                 if 'self' not in pos_message:
                     print(f"Warning: 'self' missing from pos_message: {pos_message.keys()}", flush=True)
-                if opt.guard_id not in pos_message:
-                    print(f"Warning: {opt.guard_id} missing from pos_message: {pos_message.keys()}", flush=True)
+                #if opt.guard_id not in pos_message:
+                    #print(f"Warning: {opt.guard_id} missing from pos_message: {pos_message.keys()}", flush=True)
 
             
                 
@@ -322,47 +356,59 @@ class RingAttractorModel():
                 target_angles = np.array([0.0])  # Default to 0 if no target, should not happen
             # Compute sensory input vector b
             self.compute_sensory_map(
-                target_positions=target_angles,
-                target_qualities=self.target_quality,
-                theta_i=self.theta_i,
-                kappa=self.kappa,
-                guard_angles=guard_angles,
-                guard_qualities=self.guard_quality,  # Guard quality
-                r=self.spatial_decay,  # Spatial decay rate
-                d=guard_agent_dist  # Distance to guard
-            )
-            print("Running Ring Attractor Model...")
+                            target_positions=target_angles,
+                            target_qualities=self.target_quality,
+                            theta_i=self.theta_i,
+                            kappa=self.kappa,
+                            guard_angles=guard_angles,
+                            guard_qualities=self.guard_quality,  # Guard quality
+                            r=self.spatial_decay,  # Spatial decay rate
+                            d=guard_agent_dist  # Distance to guard
+                        )
+            
+            #print("Running Ring Attractor Model...")
             start_time = time.time()
-            times, bump_positions, final_norm = self.compute_dynamics(total_time=50)
+            times, bump_positions, final_norm = self.compute_dynamics(total_time=100)
             # Log current time and neural field state
             #now = self.get_clock().now().nanoseconds / 1e9  # seconds
         
             end_time = time.time()
-            print(f"Model run completed in {end_time - start_time:.2f} seconds.")
+            
 
             # Store heading over time
             new_heading = 0.0  # one per time step
 
             # Loop over time steps
-            for z_t in self.neural_field:
-                norm_z = np.linalg.norm(z_t)
+            norm_z = np.linalg.norm(self.neural_field[-1])
 
-                if norm_z > 0.9:
-                    new_heading = compute_center_of_mass(z_t, self.theta_i)
+            new_heading = compute_center_of_mass(self.neural_field[-1], self.theta_i)
 
             # Log the neural state
-            for t, bump, field in zip(times, bump_positions, self.neural_field):
-                self.neural_log.append([t, bump] + field.tolist())
-            self.save_log()
+            self.neural_log.append([target_angles, guard_angles, norm_z] + self.neural_field[-1].tolist())
+            self.save_ring_log()
+
+            # Log the sensory map
+            self.sensory_log.append([target_angles] + self.b.tolist())
+            self.save_sensory_log()
+
+            # Log the position
+            if opt.target_id in pos_message and 'self' in pos_message:
+                self.position_log.append([pos_message['self'][0]] + [pos_message['self'][1]] + [pos_message['self'][2]] \
+                                        + [pos_message[opt.target_id][0]] + [pos_message[opt.target_id][1]] + [pos_message[opt.target_id][2]])
+            else:
+                self.position_log.append([pos_message['self'][0]] + [pos_message['self'][1]] + [pos_message['self'][2]])
+
+            self.save_position_log()
 
             with heading_lock:
                 target_heading = new_heading
             
             with perform_turn_lock:
                 perform_turn = True
+            # Signal that at least one pose has been received
+            self.output_received.set()
+            print(f"Model run completed in {end_time - start_time:.2f} seconds. Current robot heading in degrees: {math.degrees(pos_message['self'][2]):.2f} New target heading in degrees: {math.degrees(new_heading):.2f} rad, Final norm: {final_norm:.2f}", flush=True)
 
-
-            print(f"Ring attractor updated heading: {new_heading:.2f} rad")
             # Maybe no need to sleep?
             #time.sleep(self.update_interval)
 
@@ -382,7 +428,7 @@ class ViconSubscriber(Node):
             self.listener_callback,
             10)
 
-        self.pose_received = threading.Event()
+        self.pose_received = threading.Event()  # Event to signal first pose received
 
 
     def listener_callback(self, msg):
@@ -399,11 +445,23 @@ class ViconSubscriber(Node):
                 with pos_lock:
                     pos_message_g[msg.positions[i].subject_name] = (float(msg.positions[i].x_trans), float(msg.positions[i].y_trans), 
                                                                 float(msg.positions[i].z_rot_euler))
-        # Signal that at least one pose has been received
-        self.pose_received.set()
+        self.pose_received.set()  # Signal that at least one pose has been received
+                # For debugging, print the received position
                 #self.get_logger().info('subject "%s" with segment %s:' %(msg.positions[i].subject_name, msg.positions[i].segment_name))
                 #self.get_logger().info('I heard translation in x, y, z: "%f", "%f", "%f"' % (msg.positions[i].x_trans, msg.positions[i].y_trans, msg.positions[i].z_trans))
                 #self.get_logger().info('I heard rotation in x, y, z, w: "%f", "%f", "%f", "%f": ' % (msg.positions[i].x_rot, msg.positions[i].y_rot, msg.positions[i].z_rot, msg.positions[i].w))
+
+
+
+class GracefulKiller:
+  kill_now = False
+  def __init__(self):
+    signal.signal(signal.SIGINT, self.exit_gracefully)
+    signal.signal(signal.SIGTERM, self.exit_gracefully)
+
+  def exit_gracefully(self, signum, frame):
+    self.kill_now = True
+
 
 #====================== Robot Actuation Functions ======================
 """ Functions to control the robot's motors using GPIO and PCA9685.
@@ -439,10 +497,85 @@ def stopcar():
     pwm.set_pwm(ENB, 0, 0)
 
 """ Helper function to calculate motor speeds based on linear and angular velocities. """
-def calculate_speed(v_lin, v_ang):
-    left_motor = (4.895 * v_lin - 400 * v_ang) * 0.944
-    right_motor = 4.895 * v_lin + 400 * v_ang
-    return left_motor, right_motor
+def get_pwm(V_R, V_L):
+
+    d_0 = 1200
+    d_max = 4095
+
+    V_max = 0.5 # maximum tangential velocity (m/s) 
+
+    V_R = abs(V_R)
+    V_L = abs(V_L)
+
+    V_sat_R = min(V_R, V_max)
+    V_sat_L = min(V_L, V_max)
+
+    alpha_R = 1
+    alpha_L = 1
+    if V_R > 0:
+        alpha_R = V_sat_R / V_R
+    if V_L > 0:
+        alpha_L = V_sat_L / V_L
+
+    alpha = min(alpha_L, alpha_R)
+
+    V_scaled_R = V_sat_R * alpha
+    V_scaled_L = V_sat_L * alpha
+
+    v_R = V_scaled_R / V_max
+    v_L = V_scaled_L / V_max
+
+    pwm_R = 0
+    pwm_L = 0
+
+    if v_R > 0:
+        pwm_R = d_0 + (d_max - d_0) * v_R
+    if v_L > 0:
+        pwm_L = d_0 + (d_max - d_0) * v_L
+
+    return pwm_L, pwm_R
+
+
+
+# def calculate_speed(v_lin, v_ang):
+#     left_motor = 4.899 * v_lin - 384.44 * v_ang
+#     right_motor = 4.892 * v_lin + 427.5061 * v_ang
+#     print(f'Calculated motor speeds: left {left_motor}, right {right_motor}')
+
+#     return left_motor, right_motor
+
+def calculate_speed(v_lin, v_ang):  # v_lin (m/s), v_ang (rad/s)
+
+    d = 0.143    # distance btw wheels (m)
+    r = 0.035   # wheel radius (m)
+
+    
+
+    V_R = v_lin + d/2 * v_ang   # (m/s)
+    V_L = v_lin - d/2 * v_ang   # (m/s)
+
+    sign_R = 1
+    sign_L = 1
+
+    if V_R < 0:
+        sign_R = -1
+    if V_L < 0:
+        sign_L = -1
+
+    pwm_L, pwm_R = get_pwm(V_R, V_L)
+
+    pwm_L *= sign_L
+    pwm_R *= sign_R
+
+    return pwm_L, pwm_R
+    
+
+
+
+def move_robot(v_lin, v_ang):
+    
+    v_left, v_right = calculate_speed(v_lin, v_ang)
+    custom_speed(v_left, v_right)
 
 def turn_to_heading(target_heading):
     # Parameters
@@ -480,6 +613,15 @@ def turn_to_heading(target_heading):
     stopcar()
     #print("Turn complete")
 
+
+Kp, Ki, Kd = 1.0, 0.1, 0.05  
+
+# The PID’s setpoint will be updated each time with the ring attractor output
+controller = PID(Kp, Ki, Kd,
+                 setpoint=0.0,  # dummy init, will set dynamically
+                 output_limits=(-2.8, 2.8),  # robot’s max angular velocity [rad/s]
+                 sample_time=1./30.)
+
 def move_forward():
     # Parameters for straight motion
     v_lin = 200.0  # Constant linear velocity (m/s)
@@ -511,31 +653,44 @@ def move_forward():
 
 def robot_motion():
     """Thread function for robot motion."""
-    global perform_turn  # 👈 tell Python to use the global variable
+    killer = GracefulKiller()
 
+    global target_heading
+    global pos_message_g
     try:
-        while True:
-            with perform_turn_lock:
-                is_performing_turn = perform_turn
-
-            if  not is_performing_turn:
-                # Move forward
-                move_forward()
-            
-            else:
+        while not killer.kill_now:
+            if 'self' in pos_message_g:
+                with pos_lock:
+                    current_heading = pos_message_g['self'][2]
                 
-                # Get latest heading from ring attractor
-                with heading_lock:
-                    current_heading = target_heading
-                print(f"Turning to ring attractor heading: {current_heading:.2f} rad")
-                turn_to_heading(current_heading)
+                # update setpoint as target heading
+                controller.setpoint = target_heading
+                
+                # handle angle wrapping (PID doesn’t know about 2π wrap-around)
+                dif = target_heading - current_heading
+                error = wrap_angle(dif)
+                # instead of feeding current_heading directly,
+                # feed the error so PID "thinks" measured=error, setpoint=0
+                #angular_v_pid = controller(-error)
 
-                with perform_turn_lock:
-                    perform_turn = False
+                print('Error (rad): ', abs(error), flush=True)
 
-            
-            # Small pause between cycles
-            time.sleep(0.5)
+                v = 0.1 * np.cos(error - current_heading)
+                w = 0.5 * np.sin(error - current_heading)
+
+                angular_v_motor = 0.1 * error #angular_v_pid * 30
+                                
+                # Optional: edge case handling if needed
+                if abs(error) > math.pi/12:  # too far off
+                    linear_v = 0
+                else:
+                    linear_v = 0.1
+
+                # Send commands
+                move_robot(linear_v, angular_v_motor)
+
+            else:
+                set_speed(0, 0)
 
     except KeyboardInterrupt:
         print("Stopping robot motion")
@@ -543,7 +698,7 @@ def robot_motion():
         stopcar()
         GPIO.cleanup()
 
-def main():
+def main(args=None):
     rclpy.init()
     vicon_node = ViconSubscriber()
 
@@ -564,14 +719,19 @@ def main():
     # Now start your other threads
     ring_attractor = RingAttractorModel(num_targets=1)
     ring_thread = threading.Thread(target=ring_attractor.run, daemon=True)
-    motion_thread = threading.Thread(target=robot_motion, daemon=True)
+    #motion_thread = threading.Thread(target=robot_motion, daemon=True)
 
     ring_thread.start()
-    motion_thread.start()
-
+    
+    # Wait until we have received at least one pose
+    print("Waiting for first ring attractor output...", flush=True)
+    ring_attractor.output_received.wait()   # blocks until first pose callback
+    print("Ringattractor output received, starting control threads!", flush=True)
+    
+    robot_motion()  # Run in main thread for better signal handling
     try:
         while True:
-            time.sleep(1)
+            time.sleep(0.1)
     except KeyboardInterrupt:
         print("Shutting down")
         ring_attractor.stop()
