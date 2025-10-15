@@ -126,6 +126,7 @@ class Options():
         self.linear_speed = float(parameters["linear_speed"])
         self.angular_speed = float(parameters["angular_speed"])
         self.time_to_compute_dynamics = float(parameters['time_to_compute_dynamics'])
+        self.pid_limits = float(parameters['pid_limits'])
 
 opt = Options()
 
@@ -330,6 +331,11 @@ class RingAttractorModel():
             writer.writerow(header)
             writer.writerows(self.position_log)
 
+    def on_destroy(self):
+        self.save_ring_log()
+        self.save_sensory_log()
+        self.save_position_log()
+
     def run(self):
         """
         Run the model for a specified number of timesteps.
@@ -339,8 +345,18 @@ class RingAttractorModel():
         global target_heading
         global perform_turn
         pos_message = {}
+        angular_pid = PID(
+            Kp=0.5, 
+            Ki=0.1, 
+            Kd=0.2, 
+            setpoint=0, 
+            output_limits=(-math.radians(opt.pid_limits), math.radians(opt.pid_limits)) # set the limits to 90 degrees/s  
+        )
+    
+        dt = 0.1  # Control loop time step
 
         while self.running:
+            start_time = time.time()
             # Copy the global position message to local variable
             with pos_lock:
                 pos_message = pos_message_g.copy()
@@ -429,12 +445,12 @@ class RingAttractorModel():
                         )
             
             #print("Running Ring Attractor Model...")
-            start_time = time.time()
+            
             times, bump_positions, final_norm = self.compute_dynamics(total_time=opt.time_to_compute_dynamics)
             # Log current time and neural field state
             #now = self.get_clock().now().nanoseconds / 1e9  # seconds
         
-            end_time = time.time()
+            
             
 
             # Store heading over time
@@ -447,11 +463,10 @@ class RingAttractorModel():
 
             # Log the neural state
             self.neural_log.append([target_angles, guard_angles, norm_z] + self.neural_field[-1].tolist())
-            self.save_ring_log()
+            
 
             # Log the sensory map
             self.sensory_log.append([target_angles] + self.b.tolist())
-            self.save_sensory_log()
 
             # Log the position
             for i, target_id in enumerate(opt.target_ids):
@@ -469,18 +484,69 @@ class RingAttractorModel():
             else:
                 self.position_log.append([pos_message['self'][0]] + [pos_message['self'][1]] + [pos_message['self'][2]])"""
 
-            self.save_position_log()
 
-            with heading_lock:
-                target_heading = new_heading
-            
-            with perform_turn_lock:
-                perform_turn = True
-            # Signal that at least one pose has been received
-            self.output_received.set()
+            end_time = time.time()
             print(f"Model run completed in {end_time - start_time:.2f} seconds. Current robot heading in degrees: {math.degrees(pos_message['self'][2]):.2f} New target heading in degrees: {math.degrees(new_heading):.2f} rad, Final norm: {final_norm:.2f}", flush=True)
+            # Sleep to maintain a reasonable loop rate
+            #self.proportional_control(pos_message['self'][2], new_heading)
+            self.pid_control(angular_pid, pos_message['self'][2], new_heading, dt)
+        
 
             
+
+    def pid_control(self, angular_pid, current_heading, target_heading, dt = 0.1):
+        if 'self' in pos_message_g:
+
+            # Handle angle wrapping
+            dif = target_heading - current_heading
+            error = wrap_angle(dif)
+
+            # Compute angular velocity using PID (setpoint=0, measured=-error to correct towards 0)
+            pid_output = angular_pid.compute(-error, dt)  # dt from loop timing
+
+            # Smooth linear velocity: Scale with cos(error) for gradual reduction
+            linear_v = opt.linear_speed * np.cos(error)  # Ranges from 0.1 (error=0) to 0 (error=±90deg)
+            linear_v = max(linear_v, 0.1)  # Optional min speed to avoid full stop
+            angular_v_motor = math.copysign(min(max(abs(pid_output), math.radians(opt.angular_speed)), math.radians(opt.angular_speed)), pid_output)
+
+            # Optional: Further reduce linear_v for very large errors
+            #if abs(error) > math.radians(100):
+            #    linear_v = 0
+                            
+            print(f'Error (deg): {abs(math.degrees(error))}, angular velocity: {math.degrees(angular_v_motor)}, linear velocity {linear_v}', flush=True)
+
+            # Send commands
+            move_robot(linear_v, angular_v_motor)
+            time.sleep(0.1)  # Maintain loop rate
+
+        else:
+            set_speed(0, 0)
+    def proportional_control(self, current_heading, target_heading):
+        if 'self' in pos_message_g:
+            
+            # handle angle wrapping (PID doesn’t know about 2π wrap-around)
+            dif = target_heading - current_heading
+            error = wrap_angle(dif)
+            # instead of feeding current_heading directly,
+            # feed the error so PID "thinks" measured=error, setpoint=0
+            #angular_v_pid = controller(-error)
+
+            #angular_v_motor =  error #max(math.radians(opt.angular_speed), 0.1 * error) #angular_v_pid * 30
+            angular_v_motor = math.copysign(min(max(abs(0.1 * error), math.radians(opt.angular_speed)), math.radians(opt.angular_speed)), error)
+
+
+                            
+            # Optional: edge case handling if needed
+            if abs(error) > math.radians(15) :#math.pi/12:  # too far off
+                linear_v = 0
+            else:
+                linear_v = opt.linear_speed
+
+            print(f'Error (deg): {abs(math.degrees(error))}, angular velocity: {math.degrees(angular_v_motor)}, linear velocity {linear_v}', flush=True)
+
+            # Send commands
+            move_robot(linear_v, angular_v_motor)
+
 
     def stop(self):
         """Stop the ring attractor."""
@@ -706,7 +772,7 @@ def move_forward():
 
     # Run for fixed duration
     while time.time() - start_time < move_duration:
-        time.sleep(0.01)  # Small delay to prevent blocking
+        time.sleep(0.1)  # Small delay to prevent blocking
 
     # Stop the robot
     stopcar()
@@ -746,7 +812,7 @@ def robot_motion():
         Ki=0.1, 
         Kd=0.2, 
         setpoint=0, 
-        output_limits=(-1.0, 1.0)
+        output_limits=(-math.radians(opt.pid_limits), math.radians(opt.pid_limits)) # set the limits to 90 degrees/s  
         )
     
     dt = 0.1  # Control loop time step
@@ -794,14 +860,17 @@ def robot_motion():
 
                 # Smooth linear velocity: Scale with cos(error) for gradual reduction
                 linear_v = 0.1 * np.cos(error)  # Ranges from 0.1 (error=0) to 0 (error=±90deg)
-                linear_v = max(linear_v, 0.01)  # Optional min speed to avoid full stop
+                linear_v = max(linear_v, opt.linear_speed)  # Optional min speed to avoid full stop
 
                 # Optional: Further reduce linear_v for very large errors
-                if abs(error) > math.radians(90):
+                if abs(error) > math.radians(100):
                     linear_v = 0
+                                
+                print(f'Error (deg): {abs(math.degrees(error))}, angular velocity: {math.degrees(angular_v_motor)}, linear velocity {linear_v}', flush=True)
 
                 # Send commands
                 move_robot(linear_v, angular_v_motor)
+                time.sleep(0.1)  # Maintain loop rate
 
             else:
                 set_speed(0, 0)
@@ -832,23 +901,25 @@ def main(args=None):
 
     # Now start your other threads
     ring_attractor = RingAttractorModel()
-    ring_thread = threading.Thread(target=ring_attractor.run, daemon=True)
+    
+    #ring_thread = threading.Thread(target=ring_attractor.run, daemon=False)
     #motion_thread = threading.Thread(target=robot_motion, daemon=True)
 
-    ring_thread.start()
+    #ring_thread.start()
     
     # Wait until we have received at least one pose
-    print("Waiting for first ring attractor output...", flush=True)
-    ring_attractor.output_received.wait()   # blocks until first pose callback
-    print("Ringattractor output received, starting control threads!", flush=True)
+    #print("Waiting for first ring attractor output...", flush=True)
+    #ring_attractor.output_received.wait()   # blocks until first pose callback
+    #print("Ringattractor output received, starting control threads!", flush=False)
     
-    robot_motion()  # Run in main thread for better signal handling
+    #robot_motion()  # Run in main thread for better signal handling
     try:
-        while True:
-            time.sleep(0.1)
+        ring_attractor.run()
     except KeyboardInterrupt:
         print("Shutting down")
+        ring_attractor.on_destroy()
         ring_attractor.stop()
+        
     finally:
         stopcar()
         GPIO.cleanup()

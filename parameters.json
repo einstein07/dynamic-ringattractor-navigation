@@ -13,7 +13,9 @@
     "beta": 1.0,
     "spatial_decay": 6.0,
     "sigma": 0.01,
-    "linear_speed": 0.1,
-    "angular_speed": 190,
-    "time_to_compute_dynamics": 50
+    "linear_speed": 0.3,
+    "angular_speed": 90,
+    "time_to_compute_dynamics": 50,
+    "pid_limits": 70
+
 }
