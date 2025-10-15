@@ -22,15 +22,13 @@ import threading
 """Scientific imports"""
 import numpy as np
 from scipy.stats import vonmises
-from scipy.integrate import solve_ivp
+from scipy.integrate import solve_ivp, odeint
 
 """Logging imports"""
 import os
 import csv
-import cv2
 
-from simple_pid import PID
-from numba import njit
+from numba import njit, prange
 
 # Initialize motor control
 pwm = Adafruit_PCA9685.PCA9685()
@@ -112,43 +110,51 @@ with open(param_file, 'r') as f:
 class Options():
     def __init__(self):
         self.id = parameters["id"]
-        self.guard_id = parameters["guard_id"]
-        self.target_id = parameters["target_id"]
-        self.corner1 = (float(parameters["corner1"][0]), float(parameters["corner1"][1]))  # limit moving area x, y
-        self.corner2 = (float(parameters["corner2"][0]), float(parameters["corner2"][1]))
-        #self.rot_index = int(parameters["rot_index"])  # message index of rotation angle
-        self.update_time = float(parameters["update_time"])  # time for updating current position in seconds
-        self.minimal_dist = float(parameters["minimal_dist"])  # distance defining two car too close
-        self.away_scale = float(parameters["away_scale"])  # amount of going away when two cars are too close
+        self.guard_ids = np.array(parameters["guard_ids"])
+        self.target_ids = np.array(parameters["target_ids"])
+        self.num_neurons = int(parameters["num_neurons"])
+        self.num_of_targets = int(parameters["num_of_targets"])
+        self.num_of_guards = int(parameters["num_of_guards"])
+        self.target_qualities = np.array(parameters["target_qualities"])
+        self.guard_qualities = np.array(parameters["guard_qualities"])
+        self.kappa = float(parameters["kappa"])
+        self.v = float(parameters["v"])
+        self.u = float(parameters["u"])
+        self.beta = float(parameters["beta"])
+        self.spatial_decay = float(parameters["spatial_decay"])
+        self.sigma = float(parameters["sigma"])
+        self.linear_speed = float(parameters["linear_speed"])
         self.angular_speed = float(parameters["angular_speed"])
-        self.rotate_scale = float(parameters['rotate_scale'])
+        self.time_to_compute_dynamics = float(parameters['time_to_compute_dynamics'])
 
 opt = Options()
 
 #====================== Ring Attractor Model ======================
 
 class RingAttractorModel():
-    def __init__(self, num_neurons=100, num_targets=1, target_quality=1.0, guard_quality=-15.0, kappa=20.0, v=0.5, u=6.0, beta=1.0, spatial_decay=2.0, sigma=0.01, update_interval=1.0):
+    def __init__(self):
         # Number of neurons in the ring attractor
-        self.num_neurons = num_neurons
+        self.num_neurons = opt.num_neurons
         # Number of targets (e.g., blobs) to track
-        self.num_targets = num_targets
+        self.num_targets = opt.num_of_targets
+        # Number of guards (e.g., obstacles)
+        self.num_guards = opt.num_of_guards
         # Quality of targets (e.g., blob detection confidence)
-        self.target_quality = np.array([target_quality])
+        self.target_qualities = opt.target_qualities
         # Quality of guards (e.g., negative influence)
-        self.guard_quality = np.array([guard_quality])
+        self.guard_qualities = opt.guard_qualities
         # Concentration (inverse of variance) for von Mises
-        self.kappa = kappa
+        self.kappa = opt.kappa
         # # Shape parameter v for the interaction kernel
-        self.v = v
+        self.v = opt.v
         # Coupling strength u for the neural field dynamics
-        self.u = u
+        self.u = opt.u
         # Beta value for the neural field dynamics
-        self.beta = beta
+        self.beta = opt.beta
         # Spatial decay rate for guard influence
-        self.spatial_decay = spatial_decay  
+        self.spatial_decay = opt.spatial_decay  
         # Sigma value, for noise
-        self.sigma = sigma
+        self.sigma = opt.sigma
         # Neuron preferred angles evenly spaced on the circle
         self.theta_i = np.linspace(-np.pi, np.pi, self.num_neurons, endpoint=False)
         # Sensory map (sensory input vector)
@@ -159,8 +165,6 @@ class RingAttractorModel():
         # Neural field state
         self.neural_field = np.zeros(self.num_neurons)
 
-        # Update interval for target heading
-        self.update_interval = update_interval  # Time between heading updates (seconds)
         self.running = True
         
 
@@ -230,20 +234,38 @@ class RingAttractorModel():
         # Now compute M using the vectorized formula
         return ((1 / self.num_neurons) * np.cos(np.pi * (delta_ij / np.pi) ** self.v))
 
-        
     @staticmethod
-    @njit
-    def dynamics(t, y, u, b, M, beta, n, sigma):
+    @njit(fastmath=True)
+    def randn_like(y, sigma, inv_sqrt_n):
+        out = np.empty_like(y)
+        for i in prange(y.size):
+            out[i] = np.random.normal(0.0, sigma) * inv_sqrt_n
+        return out
+
+    @staticmethod
+    @njit(fastmath=True)
+    def dynamics(t, y, u, b, M, beta, n, sigma, randn_like_func):
         """ Computes the dynamics of the ring attractor model."""
         # Noise vector (same shape as y)
         #noise = (sigma / n) * np.random.randn(*y.shape)
-        noise = np.random.normal(0, sigma, size=y.shape) / np.sqrt(n)  # Scale noise by sqrt(n)
-
+        #noise = np.random.normal(0, sigma, size=y.shape) / np.sqrt(n)  # Scale noise by sqrt(n)
+        noise = randn_like_func(y, sigma, 1.0 / np.sqrt(n))
         dydt = -y + np.tanh(u * M @ y + b - beta) - np.tanh(-beta) + noise 
         #print("y.shape:", y.shape, "dydt.shape:", dydt.shape)
         # Dynamics for z
         return dydt
         
+    @njit
+    def euler_integrate(y0, t_eval, u, b, M, beta, n, sigma, randn_like_func):
+        dt = t_eval[1] - t_eval[0]
+        y = np.zeros((len(t_eval), len(y0)))
+        y[0] = y0
+        for i in range(1, len(t_eval)):
+            # Scale noise by sqrt(dt) for proper SDE approximation
+            noise = randn_like_func(y[i-1], sigma * np.sqrt(dt), 1.0 / np.sqrt(n))
+            dydt = -y[i-1] + np.tanh(u * M @ y[i-1] + b - beta) - np.tanh(-beta) + noise
+            y[i] = y[i-1] + dt * dydt
+        return y
         
 
     # Integrate timesteps to simulate the neural field dynamics
@@ -251,19 +273,32 @@ class RingAttractorModel():
         t_eval = np.arange(0, total_time, dt)
         y0 = np.random.randn(self.num_neurons) * 0.1
         
-        result = solve_ivp(
-            fun=lambda t, y: RingAttractorModel.dynamics(t, y, self.u, self.b, self.M, self.beta, self.num_neurons, self.sigma),
+        """result = solve_ivp(
+            fun=lambda t, y: RingAttractorModel.dynamics(t, y, self.u, self.b, self.M, self.beta, self.num_neurons, self.sigma, RingAttractorModel.randn_like),
             t_span=(0, total_time),
             y0=y0,
             t_eval=t_eval,
-            method='RK45',       # use faster method
+            method='LSODA',       # use faster method
             rtol=1e-2,             # relax tolerance for speed
             atol=1e-4,  
             vectorized=False # Enable vectorization for efficiency
         )
         
         self.neural_field = result.y.T  # Final state
-        times = result.t
+        times = result.t"""
+
+        """result = odeint(
+            func=lambda y, t: RingAttractorModel.dynamics(t, y, self.u, self.b, self.M, self.beta, self.num_neurons, self.sigma, RingAttractorModel.randn_like),
+            y0=y0,
+            t=t_eval,
+            rtol=1e-1,  # Looser relative tolerance
+            atol=1e-3   # Looser absolute tolerance
+        )
+        self.neural_field = result  # Already shaped as (len(t_eval), num_neurons)
+        times = t_eval  # Time points are just the input t_eval"""
+        self.neural_field = RingAttractorModel.euler_integrate(y0, t_eval, self.u, self.b, self.M, self.beta, self.num_neurons, self.sigma, RingAttractorModel.randn_like)
+        times = t_eval
+        
     
         # Compute CoM of bump activity at each time
         bump_positions = np.array([compute_center_of_mass(z_t, self.theta_i) for z_t in self.neural_field])
@@ -313,62 +348,89 @@ class RingAttractorModel():
             guard_angles = None
             guard_agent_dist = None
             target_angles = None
-
-            if opt.target_id in pos_message and 'self' in pos_message:
-                #print(f"pos_message: {pos_message.keys()}", flush=True)
-
-                """ Compute guard angles and distance to guard if available """
-                if opt.guard_id in pos_message:
-                    guard_agent_dist = math.sqrt( (pos_message[opt.guard_id][0] - pos_message['self'][0]) ** 2 \
-                                        + (pos_message[opt.guard_id][1] - pos_message['self'][1]) ** 2 )
-                    guard_agent_dist /= 1000.0  # convert to meters
-                    
-                    angle_to_guard = angle_to_guard_egocentric(
-                        (pos_message['self'][0], pos_message['self'][1]),
-                        pos_message['self'][2],
-                        (pos_message[opt.guard_id][0], pos_message[opt.guard_id][1])
-                    )
-
-                    guard_angles = np.array([angle_to_guard])  # shape (1,)
-
-                """ Compute target angles if available """
-                angle_to_target = angle_to_guard_egocentric(
-                        (pos_message['self'][0], pos_message['self'][1]),
-                        pos_message['self'][2],
-                        (pos_message[opt.target_id][0], pos_message[opt.target_id][1])
-                )
-            
-                target_angles = np.array([angle_to_target])  # shape (1,)
-                
+            # --------------------- Compute target angles ---------------------
+            if self.num_targets != len(opt.target_ids):
+                print(f"Error: num_targets {self.num_targets} does not match length of target_ids {len(opt.target_ids)}", flush=True)
+                return
             else:
-                if opt.target_id not in pos_message:
-                    print(f"Warning: {opt.guard_id} missing from pos_message: {pos_message.keys()}", flush=True)
-                    target_angles = np.array([0.0])  # Default to 0 if no target
-                if 'self' not in pos_message:
-                    print(f"Warning: 'self' missing from pos_message: {pos_message.keys()}", flush=True)
-                #if opt.guard_id not in pos_message:
-                    #print(f"Warning: {opt.guard_id} missing from pos_message: {pos_message.keys()}", flush=True)
+                for i, target_id in enumerate(opt.target_ids):
+                    if target_id in pos_message and 'self' in pos_message:
+                        angle_to_target = angle_to_guard_egocentric(
+                            (pos_message['self'][0], pos_message['self'][1]),
+                            pos_message['self'][2],
+                            (pos_message[target_id][0], pos_message[target_id][1])
+                        )
+                        if target_angles is None:
+                            target_angles = np.array([angle_to_target])
+                        else:
+                            target_angles = np.append(target_angles, angle_to_target)
+                    else:
+                        if target_id not in pos_message:
+                            print(f"Warning: {target_id} missing from pos_message: {pos_message.keys()}", flush=True)
+                            angle_to_target = 0.0  # Default to 0 if no target
+                        if 'self' not in pos_message:
+                            print(f"Warning: 'self' missing from pos_message: {pos_message.keys()}", flush=True)
+                            angle_to_target = 0.0  # Default to 0 if no self
+                        if target_angles is None:
+                            target_angles = np.array([angle_to_target])
+                        else:
+                            target_angles = np.append(target_angles, angle_to_target)
+            # -----------------------------------------------------------------------------
 
-            
-                
+            # --------------------- Compute guard angles and distance ---------------------
+            if self.num_guards != len(opt.guard_ids):
+                print(f"Error: num_guards {self.num_guards} does not match length of guard_ids {len(opt.guard_ids)}", flush=True)
+                return
+            else:
+                for i, guard_id in enumerate(opt.guard_ids):
+                    if guard_id in pos_message and 'self' in pos_message:
+                        # ------- Compute guard angles and distance to guard if available -------
+                        angle_to_guard = angle_to_guard_egocentric(
+                            (pos_message['self'][0], pos_message['self'][1]),
+                            pos_message['self'][2],
+                            (pos_message[guard_id][0], pos_message[guard_id][1])
+                        )
+                        if guard_angles is None:
+                            guard_angles = np.array([angle_to_guard])
+                        else:
+                            guard_angles = np.append(guard_angles, angle_to_guard)
+                        # -----------------------------------------------------------------------
+
+                        # ------- Compute distance to guard -------
+                        guard_agent_dist = math.sqrt( (pos_message[guard_id][0] - pos_message['self'][0]) ** 2 \
+                                            + (pos_message[guard_id][1] - pos_message['self'][1]) ** 2 )
+                        guard_agent_dist /= 1000.0  # convert to meters
+                        # -----------------------------------------------------------------------
+                    else:
+                        if guard_id not in pos_message:
+                            print(f"Warning: {guard_id} missing from pos_message: {pos_message.keys()}", flush=True)
+                            angle_to_guard = 0.0  # Default to 0 if no guard
+                        if 'self' not in pos_message:
+                            print(f"Warning: 'self' missing from pos_message: {pos_message.keys()}", flush=True)
+                            angle_to_guard = 0.0  # Default to 0 if no self
+                        if guard_angles is None:
+                            guard_angles = np.array([angle_to_guard])
+                        else:
+                            guard_angles = np.append(guard_angles, angle_to_guard)  
+                # -----------------------------------------------------------------------------         
 
             if target_angles is None:
-                target_angles = np.array([0.0])  # Default to 0 if no target, should not happen
+                target_angles = np.array([0.0])  # Default to 0 if no target, should not happen once here already
             # Compute sensory input vector b
             self.compute_sensory_map(
                             target_positions=target_angles,
-                            target_qualities=self.target_quality,
+                            target_qualities=self.target_qualities,
                             theta_i=self.theta_i,
                             kappa=self.kappa,
                             guard_angles=guard_angles,
-                            guard_qualities=self.guard_quality,  # Guard quality
+                            guard_qualities=self.guard_qualities,  # Guard quality
                             r=self.spatial_decay,  # Spatial decay rate
                             d=guard_agent_dist  # Distance to guard
                         )
             
             #print("Running Ring Attractor Model...")
             start_time = time.time()
-            times, bump_positions, final_norm = self.compute_dynamics(total_time=100)
+            times, bump_positions, final_norm = self.compute_dynamics(total_time=opt.time_to_compute_dynamics)
             # Log current time and neural field state
             #now = self.get_clock().now().nanoseconds / 1e9  # seconds
         
@@ -392,11 +454,20 @@ class RingAttractorModel():
             self.save_sensory_log()
 
             # Log the position
-            if opt.target_id in pos_message and 'self' in pos_message:
+            for i, target_id in enumerate(opt.target_ids):
+                if target_id in pos_message and 'self' in pos_message:
+                    #
+                    self.position_log.append([pos_message['self'][0]] + [pos_message['self'][1]] + [pos_message['self'][2]] \
+                                        + [pos_message[target_id][0]] + [pos_message[target_id][1]] + [pos_message[target_id][2]])  
+                else:
+                    self.position_log.append([pos_message['self'][0]] + [pos_message['self'][1]] + [pos_message['self'][2]])
+
+
+            """if opt.target_id in pos_message and 'self' in pos_message:
                 self.position_log.append([pos_message['self'][0]] + [pos_message['self'][1]] + [pos_message['self'][2]] \
                                         + [pos_message[opt.target_id][0]] + [pos_message[opt.target_id][1]] + [pos_message[opt.target_id][2]])
             else:
-                self.position_log.append([pos_message['self'][0]] + [pos_message['self'][1]] + [pos_message['self'][2]])
+                self.position_log.append([pos_message['self'][0]] + [pos_message['self'][1]] + [pos_message['self'][2]])"""
 
             self.save_position_log()
 
@@ -409,8 +480,7 @@ class RingAttractorModel():
             self.output_received.set()
             print(f"Model run completed in {end_time - start_time:.2f} seconds. Current robot heading in degrees: {math.degrees(pos_message['self'][2]):.2f} New target heading in degrees: {math.degrees(new_heading):.2f} rad, Final norm: {final_norm:.2f}", flush=True)
 
-            # Maybe no need to sleep?
-            #time.sleep(self.update_interval)
+            
 
     def stop(self):
         """Stop the ring attractor."""
@@ -613,15 +683,6 @@ def turn_to_heading(target_heading):
     stopcar()
     #print("Turn complete")
 
-
-Kp, Ki, Kd = 1.0, 0.1, 0.05  
-
-# The PID’s setpoint will be updated each time with the ring attractor output
-controller = PID(Kp, Ki, Kd,
-                 setpoint=0.0,  # dummy init, will set dynamically
-                 output_limits=(-2.8, 2.8),  # robot’s max angular velocity [rad/s]
-                 sample_time=1./30.)
-
 def move_forward():
     # Parameters for straight motion
     v_lin = 200.0  # Constant linear velocity (m/s)
@@ -650,6 +711,28 @@ def move_forward():
     # Stop the robot
     stopcar()
     #print("Forward motion complete")
+#====================== PID Controller Class ======================
+class PID:
+    def __init__(self, Kp, Ki, Kd, setpoint=0, output_limits=(-1.0, 1.0)):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.setpoint = setpoint
+        self.integral = 0
+        self.prev_error = 0
+        self.output_limits = output_limits
+
+    def compute(self, measured_value, dt):
+        error = self.setpoint - measured_value
+        self.integral += error * dt
+        # Anti-windup: Clamp integral
+        self.integral = np.clip(self.integral, -1.0 / self.Ki if self.Ki else 0, 1.0 / self.Ki if self.Ki else 0)
+        derivative = (error - self.prev_error) / dt
+        output = self.Kp * error + self.Ki * self.integral + self.Kd * derivative
+        # Clamp output
+        output = np.clip(output, self.output_limits[0], self.output_limits[1])
+        self.prev_error = error
+        return output
 
 def robot_motion():
     """Thread function for robot motion."""
@@ -657,14 +740,23 @@ def robot_motion():
 
     global target_heading
     global pos_message_g
+
+    angular_pid = PID(
+        Kp=0.5, 
+        Ki=0.1, 
+        Kd=0.2, 
+        setpoint=0, 
+        output_limits=(-1.0, 1.0)
+        )
+    
+    dt = 0.1  # Control loop time step
+
     try:
         while not killer.kill_now:
             if 'self' in pos_message_g:
-                with pos_lock:
+                """with pos_lock:
                     current_heading = pos_message_g['self'][2]
                 
-                # update setpoint as target heading
-                controller.setpoint = target_heading
                 
                 # handle angle wrapping (PID doesn’t know about 2π wrap-around)
                 dif = target_heading - current_heading
@@ -673,7 +765,7 @@ def robot_motion():
                 # feed the error so PID "thinks" measured=error, setpoint=0
                 #angular_v_pid = controller(-error)
 
-                print('Error (rad): ', abs(error), flush=True)
+                #print('Error (rad): ', abs(error), flush=True)
 
                 v = 0.1 * np.cos(error - current_heading)
                 w = 0.5 * np.sin(error - current_heading)
@@ -681,10 +773,32 @@ def robot_motion():
                 angular_v_motor = 0.1 * error #angular_v_pid * 30
                                 
                 # Optional: edge case handling if needed
-                if abs(error) > math.pi/12:  # too far off
+                if abs(error) > math.radians(15):#math.pi/12:  # too far off
                     linear_v = 0
                 else:
                     linear_v = 0.1
+
+                # Send commands
+                move_robot(linear_v, angular_v_motor)"""
+
+                # In your control loop (assuming dt is time since last update, e.g., 0.1s)
+                with pos_lock:
+                    current_heading = pos_message_g['self'][2]
+
+                # Handle angle wrapping
+                dif = target_heading - current_heading
+                error = wrap_angle(dif)
+
+                # Compute angular velocity using PID (setpoint=0, measured=-error to correct towards 0)
+                angular_v_motor = angular_pid.compute(-error, dt)  # dt from loop timing
+
+                # Smooth linear velocity: Scale with cos(error) for gradual reduction
+                linear_v = 0.1 * np.cos(error)  # Ranges from 0.1 (error=0) to 0 (error=±90deg)
+                linear_v = max(linear_v, 0.01)  # Optional min speed to avoid full stop
+
+                # Optional: Further reduce linear_v for very large errors
+                if abs(error) > math.radians(90):
+                    linear_v = 0
 
                 # Send commands
                 move_robot(linear_v, angular_v_motor)
@@ -717,7 +831,7 @@ def main(args=None):
     print("Pose received, starting control threads!", flush=True)
 
     # Now start your other threads
-    ring_attractor = RingAttractorModel(num_targets=1)
+    ring_attractor = RingAttractorModel()
     ring_thread = threading.Thread(target=ring_attractor.run, daemon=True)
     #motion_thread = threading.Thread(target=robot_motion, daemon=True)
 
