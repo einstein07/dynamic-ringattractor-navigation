@@ -17,6 +17,7 @@ import time
 import math
 import json
 import random
+import datetime
 import threading
 
 """Scientific imports"""
@@ -127,6 +128,12 @@ class Options():
         self.angular_speed = float(parameters["angular_speed"])
         self.time_to_compute_dynamics = float(parameters['time_to_compute_dynamics'])
         self.pid_limits = float(parameters['pid_limits'])
+        self.goal_tolerance = float(parameters['goal_tolerance'])  # in meters
+
+        # Parameters for logging
+        self.base_log_dir = os.path.expanduser(parameters.get('log_directory', '~/geometry-logs'))
+        os.makedirs(self.base_log_dir, exist_ok=True)         # If directory does not exist, create it
+        self.experiment_name = parameters.get('experiment_name', 'experiment')
 
 opt = Options()
 
@@ -165,9 +172,11 @@ class RingAttractorModel():
         self.M = self.compute_interaction_kernel()
         # Neural field state
         self.neural_field = np.zeros(self.num_neurons)
+        self.neural_field = np.random.randn(self.num_neurons) * 0.1  # small random initial state
 
         self.running = True
         
+        self.goal_tolerance = opt.goal_tolerance  # in meters
 
         # Initialize neural activation log
         self.neural_log = []  # Each entry: [timestamp, val1, val2, ..., valN]
@@ -176,6 +185,12 @@ class RingAttractorModel():
         self.sensory_log = []  # Each entry: [timestamp, val1, val2, ..., valN]
 
         self.position_log = []  # Each entry: [timestamp, x, y, heading]
+
+        # ----- Logging -----
+        self.base_log_dir = opt.base_log_dir
+        self.experiment_name = opt.experiment_name
+        print(f"Logging data to: {self.base_log_dir}, Experiment name: {self.experiment_name}", flush=True)
+        # -------------------
 
         # Optional: Publisher for bump CoM
         #self.field_pub = self.create_publisher(Float64MultiArray, 'neural_field', 10)
@@ -256,7 +271,7 @@ class RingAttractorModel():
         # Dynamics for z
         return dydt
         
-    @njit
+    @njit(fastmath=True)
     def euler_integrate(y0, t_eval, u, b, M, beta, n, sigma, randn_like_func):
         dt = t_eval[1] - t_eval[0]
         y = np.zeros((len(t_eval), len(y0)))
@@ -272,7 +287,7 @@ class RingAttractorModel():
     # Integrate timesteps to simulate the neural field dynamics
     def compute_dynamics(self, total_time=200, dt=0.1):
         t_eval = np.arange(0, total_time, dt)
-        y0 = np.random.randn(self.num_neurons) * 0.1
+        y0 = self.neural_field.copy()
         
         """result = solve_ivp(
             fun=lambda t, y: RingAttractorModel.dynamics(t, y, self.u, self.b, self.M, self.beta, self.num_neurons, self.sigma, RingAttractorModel.randn_like),
@@ -297,39 +312,71 @@ class RingAttractorModel():
         )
         self.neural_field = result  # Already shaped as (len(t_eval), num_neurons)
         times = t_eval  # Time points are just the input t_eval"""
-        self.neural_field = RingAttractorModel.euler_integrate(y0, t_eval, self.u, self.b, self.M, self.beta, self.num_neurons, self.sigma, RingAttractorModel.randn_like)
+        result = RingAttractorModel.euler_integrate(y0, t_eval, self.u, self.b, self.M, self.beta, self.num_neurons, self.sigma, RingAttractorModel.randn_like)
+
         times = t_eval
         
     
         # Compute CoM of bump activity at each time
-        bump_positions = np.array([compute_center_of_mass(z_t, self.theta_i) for z_t in self.neural_field])
+        bump_positions = np.array([compute_center_of_mass(z_t, self.theta_i) for z_t in result])
     
-        final_norm = np.linalg.norm(self.neural_field[-1])
+        final_norm = np.linalg.norm(result[-1])
+        self.neural_field = result[-1]  # Update neural field state
         return times, bump_positions, final_norm
 
     def save_ring_log(self):
-        log_path = os.path.expanduser("~/neural_activation_log_stationary.csv")
-        with open(log_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            header = ["target"] + ["guard"] + [f"bump_positions"] + [f"neuron_{i}" for i in range(self.num_neurons)]
-            writer.writerow(header)
-            writer.writerows(self.neural_log)
+        """Initialize the agent's log file."""
+        
+        time_stamp = f"{datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')}" # Default experiment name with timestamp
+        filename = os.path.join(self.base_log_dir, f"{self.experiment_name}_neural_activation_log_geometry_{time_stamp}.csv")
+
+        try:            
+            with open(filename, "w", newline="") as f:
+                writer = csv.writer(f)
+                header = [f"neuron_{i}" for i in range(self.num_neurons)] + ["norm_z"]
+                if self.num_targets > 0:
+                    header += ["target(s)_angles(s)"]
+                if self.num_guards > 0:
+                    header += ["guard(s)_angle(s)"]  
+                writer.writerow(header)
+                writer.writerows(self.neural_log)
+        except Exception as e:
+            print(f"Error saving position log to {filename}: {e}")
+            
 
     def save_sensory_log(self):
-        log_path = os.path.expanduser("~/sensory_map_log_stationary.csv")
-        with open(log_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            header = ["target"] + [f"neuron_{i}" for i in range(self.num_neurons)]
-            writer.writerow(header)
-            writer.writerows(self.sensory_log)
+        """Initialize the agent's log file."""
+        time_stamp = f"{datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')}" # Default experiment name with timestamp
+
+        filename = os.path.join(self.base_log_dir, f"{self.experiment_name}_sensory_map_log_geometry{time_stamp}.csv")
+        try:
+            with open(filename, "w", newline="") as f:
+                writer = csv.writer(f)
+                header = [f"neuron_{i}" for i in range(self.num_neurons)]
+                if self.num_targets > 0:
+                    header += ["angles_to_target(s)_from_vicon"] 
+                writer.writerow(header)
+                writer.writerows(self.sensory_log)
+        except Exception as e:
+            print(f"Error saving sensory log to {filename}: {e}")
 
     def save_position_log(self):
-        log_path = os.path.expanduser("~/position_log_stationary.csv")
-        with open(log_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            header = ["x"] + ["y"] + ["heading"] + ["x_target"] + ["y_target"] + ["heading_target"]
-            writer.writerow(header)
-            writer.writerows(self.position_log)
+        """Initialize the agent's log file."""
+        time_stamp = f"{datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S')}" # Default experiment name with timestamp
+
+        filename = os.path.join(self.base_log_dir, f"{self.experiment_name}_position_log_geometry{time_stamp}.csv")
+        
+        try:
+            with open(filename, "w", newline="") as f:
+                writer = csv.writer(f)
+                header = ["x_robot", "y_robot", "heading_robot"]
+                for target_id in opt.target_ids:
+                    header += [f"x_{target_id}", f"y_{target_id}"]
+                writer.writerow(header)
+                writer.writerows(self.position_log)
+        except Exception as e:
+            print(f"Error saving neural log to {filename}: {e}")
+
 
     def on_destroy(self):
         self.save_ring_log()
@@ -371,6 +418,22 @@ class RingAttractorModel():
             else:
                 for i, target_id in enumerate(opt.target_ids):
                     if target_id in pos_message and 'self' in pos_message:
+                        
+                        dx = pos_message[target_id][0] - pos_message['self'][0] 
+                        dy = pos_message[target_id][1] - pos_message['self'][1] 
+                        distance = math.hypot(dx, dy) / 1000.0  # convert to meters
+                        # Stop if goal reached
+                        if distance <= self.goal_tolerance:
+                            stopcar()
+                            print("Goal reached!", flush=True)
+                            self.on_destroy()
+                            # Destroy node and shutdown ROS cleanly
+                            self.destroy_node()
+                            rclpy.shutdown()
+                            return
+                        #else:
+                        #    print(f"Distance to target {target_id}: {distance:.2f} meters", flush=True)
+
                         angle_to_target = angle_to_guard_egocentric(
                             (pos_message['self'][0], pos_message['self'][1]),
                             pos_message['self'][2],
@@ -456,27 +519,23 @@ class RingAttractorModel():
             # Store heading over time
             new_heading = 0.0  # one per time step
 
-            # Loop over time steps
-            norm_z = np.linalg.norm(self.neural_field[-1])
 
-            new_heading = compute_center_of_mass(self.neural_field[-1], self.theta_i)
+            new_heading = compute_center_of_mass(self.neural_field, self.theta_i)
 
             # Log the neural state
-            self.neural_log.append([target_angles, guard_angles, norm_z] + self.neural_field[-1].tolist())
+            self.neural_log.append( self.neural_field.tolist() + [final_norm] + [target_angles] + [guard_angles])
             
 
             # Log the sensory map
-            self.sensory_log.append([target_angles] + self.b.tolist())
+            self.sensory_log.append( self.b.tolist() + [target_angles])
 
             # Log the position
-            for i, target_id in enumerate(opt.target_ids):
-                if target_id in pos_message and 'self' in pos_message:
-                    #
-                    self.position_log.append([pos_message['self'][0]] + [pos_message['self'][1]] + [pos_message['self'][2]] \
-                                        + [pos_message[target_id][0]] + [pos_message[target_id][1]] + [pos_message[target_id][2]])  
-                else:
-                    self.position_log.append([pos_message['self'][0]] + [pos_message['self'][1]] + [pos_message['self'][2]])
-
+            robot_row = [pos_message['self'][0], pos_message['self'][1], pos_message['self'][2]]
+            for target_id in opt.target_ids:
+                if target_id in pos_message:
+                    robot_row += [pos_message[target_id][0], pos_message[target_id][1]]
+                
+            self.position_log.append(robot_row)
 
             """if opt.target_id in pos_message and 'self' in pos_message:
                 self.position_log.append([pos_message['self'][0]] + [pos_message['self'][1]] + [pos_message['self'][2]] \
@@ -490,6 +549,8 @@ class RingAttractorModel():
             # Sleep to maintain a reasonable loop rate
             #self.proportional_control(pos_message['self'][2], new_heading)
             self.pid_control(angular_pid, pos_message['self'][2], new_heading, dt)
+
+            
         
 
             
