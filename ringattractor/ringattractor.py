@@ -263,11 +263,9 @@ class RingAttractorModel():
     def dynamics(t, y, u, b, M, beta, n, sigma, randn_like_func):
         """ Computes the dynamics of the ring attractor model."""
         # Noise vector (same shape as y)
-        #noise = (sigma / n) * np.random.randn(*y.shape)
-        #noise = np.random.normal(0, sigma, size=y.shape) / np.sqrt(n)  # Scale noise by sqrt(n)
+        
         noise = randn_like_func(y, sigma, 1.0 / np.sqrt(n))
         dydt = -y + np.tanh(u * M @ y + b - beta) - np.tanh(-beta) + noise 
-        #print("y.shape:", y.shape, "dydt.shape:", dydt.shape)
         # Dynamics for z
         return dydt
         
@@ -289,29 +287,7 @@ class RingAttractorModel():
         t_eval = np.arange(0, total_time, dt)
         y0 = self.neural_field.copy()
         
-        """result = solve_ivp(
-            fun=lambda t, y: RingAttractorModel.dynamics(t, y, self.u, self.b, self.M, self.beta, self.num_neurons, self.sigma, RingAttractorModel.randn_like),
-            t_span=(0, total_time),
-            y0=y0,
-            t_eval=t_eval,
-            method='LSODA',       # use faster method
-            rtol=1e-2,             # relax tolerance for speed
-            atol=1e-4,  
-            vectorized=False # Enable vectorization for efficiency
-        )
         
-        self.neural_field = result.y.T  # Final state
-        times = result.t"""
-
-        """result = odeint(
-            func=lambda y, t: RingAttractorModel.dynamics(t, y, self.u, self.b, self.M, self.beta, self.num_neurons, self.sigma, RingAttractorModel.randn_like),
-            y0=y0,
-            t=t_eval,
-            rtol=1e-1,  # Looser relative tolerance
-            atol=1e-3   # Looser absolute tolerance
-        )
-        self.neural_field = result  # Already shaped as (len(t_eval), num_neurons)
-        times = t_eval  # Time points are just the input t_eval"""
         result = RingAttractorModel.euler_integrate(y0, t_eval, self.u, self.b, self.M, self.beta, self.num_neurons, self.sigma, RingAttractorModel.randn_like)
 
         times = t_eval
@@ -431,9 +407,7 @@ class RingAttractorModel():
                             self.destroy_node()
                             rclpy.shutdown()
                             return
-                        #else:
-                        #    print(f"Distance to target {target_id}: {distance:.2f} meters", flush=True)
-
+                        
                         angle_to_target = angle_to_guard_egocentric(
                             (pos_message['self'][0], pos_message['self'][1]),
                             pos_message['self'][2],
@@ -537,12 +511,7 @@ class RingAttractorModel():
                 
             self.position_log.append(robot_row)
 
-            """if opt.target_id in pos_message and 'self' in pos_message:
-                self.position_log.append([pos_message['self'][0]] + [pos_message['self'][1]] + [pos_message['self'][2]] \
-                                        + [pos_message[opt.target_id][0]] + [pos_message[opt.target_id][1]] + [pos_message[opt.target_id][2]])
-            else:
-                self.position_log.append([pos_message['self'][0]] + [pos_message['self'][1]] + [pos_message['self'][2]])"""
-
+            
 
             end_time = time.time()
             print(f"Model run completed in {end_time - start_time:.2f} seconds. Current robot heading in degrees: {math.degrees(pos_message['self'][2]):.2f} New target heading in degrees: {math.degrees(new_heading):.2f} rad, Final norm: {final_norm:.2f}", flush=True)
@@ -732,14 +701,6 @@ def get_pwm(V_R, V_L):
 
     return pwm_L, pwm_R
 
-
-
-# def calculate_speed(v_lin, v_ang):
-#     left_motor = 4.899 * v_lin - 384.44 * v_ang
-#     right_motor = 4.892 * v_lin + 427.5061 * v_ang
-#     print(f'Calculated motor speeds: left {left_motor}, right {right_motor}')
-
-#     return left_motor, right_motor
 
 def calculate_speed(v_lin, v_ang):  # v_lin (m/s), v_ang (rad/s)
 
@@ -963,17 +924,7 @@ def main(args=None):
     # Now start your other threads
     ring_attractor = RingAttractorModel()
     
-    #ring_thread = threading.Thread(target=ring_attractor.run, daemon=False)
-    #motion_thread = threading.Thread(target=robot_motion, daemon=True)
-
-    #ring_thread.start()
     
-    # Wait until we have received at least one pose
-    #print("Waiting for first ring attractor output...", flush=True)
-    #ring_attractor.output_received.wait()   # blocks until first pose callback
-    #print("Ringattractor output received, starting control threads!", flush=False)
-    
-    #robot_motion()  # Run in main thread for better signal handling
     try:
         ring_attractor.run()
     except KeyboardInterrupt:
