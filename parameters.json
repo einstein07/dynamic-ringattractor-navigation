@@ -1,11 +1,11 @@
 {
     "id": "osoyoo_1",
-    "guard_ids": ["osoyoo_2"],
-    "target_ids": ["osoyoo_3"],
+    "guard_ids": [],
+    "target_ids": ["osoyoo_2", "osoyoo_3"],
     "num_neurons": 32,
-    "num_of_targets": 1,
-    "num_of_guards": 1,
-    "target_qualities": [1.0],
+    "num_of_targets": 2,
+    "num_of_guards": 0,
+    "target_qualities": [1.0, 1.0],
     "guard_qualities": [-15.0],
     "kappa": 20.0,
     "v": 0.5,
@@ -13,9 +13,12 @@
     "beta": 1.0,
     "spatial_decay": 6.0,
     "sigma": 0.01,
-    "linear_speed": 0.3,
-    "angular_speed": 90,
+    "linear_speed": 0.1,
+    "angular_speed": 20,
     "time_to_compute_dynamics": 50,
-    "pid_limits": 70
+    "pid_limits": 70,
+    "goal_tolerance": 0.4,
+    "log_directory": "~/geometry-logs/run-1/",
+    "experiment_name": "run_1"
 
 }

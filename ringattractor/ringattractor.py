@@ -56,9 +56,7 @@ perform_turn = False
 heading_lock = threading.Lock()
 perform_turn_lock = threading.Lock()
 
-# Estimated horizontal field of view (in degrees)
-CAMERA_FOV_X = 62  # Raspberry Pi cam or USB webcam typical FOV
-cap = None  # Initialize camera capture
+
 
 #======================define global pose variable=========================
 
@@ -345,9 +343,15 @@ class RingAttractorModel():
         try:
             with open(filename, "w", newline="") as f:
                 writer = csv.writer(f)
+                # ---------- Log the robot position ---------------
                 header = ["x_robot", "y_robot", "heading_robot"]
+                # ------------- Log the target positions ---------------
                 for target_id in opt.target_ids:
-                    header += [f"x_{target_id}", f"y_{target_id}"]
+                    header += [f"target_x_{target_id}", f"target_y_{target_id}"]
+                # ------------- Log the guard positions ---------------
+                for guard_id in opt.guard_ids:
+                    header += [f"guard_x_{guard_id}", f"guard_y_{guard_id}"]
+
                 writer.writerow(header)
                 writer.writerows(self.position_log)
         except Exception as e:
@@ -404,8 +408,6 @@ class RingAttractorModel():
                             print("Goal reached!", flush=True)
                             self.on_destroy()
                             # Destroy node and shutdown ROS cleanly
-                            self.destroy_node()
-                            rclpy.shutdown()
                             return
                         
                         angle_to_target = angle_to_guard_egocentric(
@@ -503,12 +505,17 @@ class RingAttractorModel():
             # Log the sensory map
             self.sensory_log.append( self.b.tolist() + [target_angles])
 
-            # Log the position
+            # ---------- Log the robot position ---------------
             robot_row = [pos_message['self'][0], pos_message['self'][1], pos_message['self'][2]]
+            # ------------- Log the target positions ---------------
             for target_id in opt.target_ids:
                 if target_id in pos_message:
                     robot_row += [pos_message[target_id][0], pos_message[target_id][1]]
-                
+            # ------------- Log the guard positions ---------------
+            for guard_id in opt.guard_ids:
+                if guard_id in pos_message:
+                    robot_row += [pos_message[guard_id][0], pos_message[guard_id][1]]
+            
             self.position_log.append(robot_row)
 
             
@@ -735,70 +742,8 @@ def move_robot(v_lin, v_ang):
     v_left, v_right = calculate_speed(v_lin, v_ang)
     custom_speed(v_left, v_right)
 
-def turn_to_heading(target_heading):
-    # Parameters
-    v_lin = 0.0  # No forward motion, only rotation
-    v_ang = 3.0  # Fixed angular velocity (rad/s)
-    max_motor_speed = 4095  # Max PWM value for PCA9685 (12-bit)
 
-    # Calculate time to turn
-    angle_to_turn = abs(target_heading)  # Magnitude of rotation needed
-    turn_time = angle_to_turn / abs(v_ang)  # Time = angle / angular speed
 
-    # Determine turn direction
-    if target_heading < 0:
-        v_ang = -v_ang  # Negative for clockwise turn
-
-    # Calculate motor speeds
-    v_left, v_right = calculate_speed(v_lin, v_ang)
-
-    # Limit motor speeds to valid PWM range
-    v_left = max(min(v_left, max_motor_speed), -max_motor_speed)
-    v_right = max(min(v_right, max_motor_speed), -max_motor_speed)
-
-    #print(f"Turning {target_heading:.2f} rad, v_ang: {v_ang:.2f} rad/s, time: {turn_time:.2f} s")
-    #print(f"Left motor: {v_left:.2f}, Right motor: {v_right:.2f}")
-
-    # Actuate motors
-    start_time = time.time()
-    custom_speed(v_left, v_right)
-
-    # Run for calculated duration
-    while time.time() - start_time < turn_time:
-        time.sleep(0.01)  # Small delay to prevent blocking
-
-    # Stop the robot
-    stopcar()
-    #print("Turn complete")
-
-def move_forward():
-    # Parameters for straight motion
-    v_lin = 200.0  # Constant linear velocity (m/s)
-    v_ang = 0.0  # No rotation
-    max_motor_speed = 4095  # Max PWM value
-    move_duration = 2.0  # Move forward for 2 seconds
-
-    # Calculate motor speeds
-    v_left, v_right = calculate_speed(v_lin, v_ang)
-
-    # Limit motor speeds to valid PWM range
-    v_left = max(min(v_left, max_motor_speed), -max_motor_speed)
-    v_right = max(min(v_right, max_motor_speed), -max_motor_speed)
-
-    #print(f"Moving forward with v_lin: {v_lin:.2f} m/s")
-    #print(f"Left motor: {v_left:.2f}, Right motor: {v_right:.2f}")
-
-    # Actuate motors
-    start_time = time.time()
-    custom_speed(v_left, v_right)
-
-    # Run for fixed duration
-    while time.time() - start_time < move_duration:
-        time.sleep(0.1)  # Small delay to prevent blocking
-
-    # Stop the robot
-    stopcar()
-    #print("Forward motion complete")
 #====================== PID Controller Class ======================
 class PID:
     def __init__(self, Kp, Ki, Kd, setpoint=0, output_limits=(-1.0, 1.0)):
