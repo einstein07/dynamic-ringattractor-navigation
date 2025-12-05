@@ -389,14 +389,16 @@ class RingAttractorModel():
                 pos_message = pos_message_g.copy()
             
             guard_angles = None
-            guard_agent_dist = None
+            guard_distances = None
             target_angles = None
             # --------------------- Compute target angles ---------------------
             if self.num_targets != len(opt.target_ids):
                 print(f"Error: num_targets {self.num_targets} does not match length of target_ids {len(opt.target_ids)}", flush=True)
                 return
             else:
+                target_angles = np.zeros(self.num_targets)
                 for i, target_id in enumerate(opt.target_ids):
+                    
                     if target_id in pos_message and 'self' in pos_message:
                         
                         dx = pos_message[target_id][0] - pos_message['self'][0] 
@@ -415,10 +417,7 @@ class RingAttractorModel():
                             pos_message['self'][2],
                             (pos_message[target_id][0], pos_message[target_id][1])
                         )
-                        if target_angles is None:
-                            target_angles = np.array([angle_to_target])
-                        else:
-                            target_angles = np.append(target_angles, angle_to_target)
+                        target_angles[i] = angle_to_target
                     else:
                         if target_id not in pos_message:
                             print(f"Warning: {target_id} missing from pos_message: {pos_message.keys()}", flush=True)
@@ -426,10 +425,7 @@ class RingAttractorModel():
                         if 'self' not in pos_message:
                             print(f"Warning: 'self' missing from pos_message: {pos_message.keys()}", flush=True)
                             angle_to_target = 0.0  # Default to 0 if no self
-                        if target_angles is None:
-                            target_angles = np.array([angle_to_target])
-                        else:
-                            target_angles = np.append(target_angles, angle_to_target)
+                        target_angles[i] = angle_to_target
             # -----------------------------------------------------------------------------
 
             # --------------------- Compute guard angles and distance ---------------------
@@ -437,6 +433,8 @@ class RingAttractorModel():
                 print(f"Error: num_guards {self.num_guards} does not match length of guard_ids {len(opt.guard_ids)}", flush=True)
                 return
             else:
+                guard_angles = np.zeros(self.num_guards)
+                guard_distances = np.zeros(self.num_guards)
                 for i, guard_id in enumerate(opt.guard_ids):
                     if guard_id in pos_message and 'self' in pos_message:
                         # ------- Compute guard angles and distance to guard if available -------
@@ -445,28 +443,27 @@ class RingAttractorModel():
                             pos_message['self'][2],
                             (pos_message[guard_id][0], pos_message[guard_id][1])
                         )
-                        if guard_angles is None:
-                            guard_angles = np.array([angle_to_guard])
-                        else:
-                            guard_angles = np.append(guard_angles, angle_to_guard)
+                        guard_angles[i] = angle_to_guard
                         # -----------------------------------------------------------------------
 
                         # ------- Compute distance to guard -------
                         guard_agent_dist = math.sqrt( (pos_message[guard_id][0] - pos_message['self'][0]) ** 2 \
                                             + (pos_message[guard_id][1] - pos_message['self'][1]) ** 2 )
                         guard_agent_dist /= 1000.0  # convert to meters
+                        guard_distances[i] = guard_agent_dist
                         # -----------------------------------------------------------------------
                     else:
                         if guard_id not in pos_message:
                             print(f"Warning: {guard_id} missing from pos_message: {pos_message.keys()}", flush=True)
                             angle_to_guard = 0.0  # Default to 0 if no guard
+                            guard_agent_dist = 10.0  # Default to large distance if no guard
                         if 'self' not in pos_message:
                             print(f"Warning: 'self' missing from pos_message: {pos_message.keys()}", flush=True)
                             angle_to_guard = 0.0  # Default to 0 if no self
-                        if guard_angles is None:
-                            guard_angles = np.array([angle_to_guard])
-                        else:
-                            guard_angles = np.append(guard_angles, angle_to_guard)  
+                            guard_agent_dist = 10.0  # Default to large distance if no self
+                        
+                        guard_angles[i] = angle_to_guard 
+                        guard_distances[i] = guard_agent_dist 
                 # -----------------------------------------------------------------------------         
 
             if target_angles is None:
@@ -480,7 +477,7 @@ class RingAttractorModel():
                             guard_angles=guard_angles,
                             guard_qualities=self.guard_qualities,  # Guard quality
                             r=self.spatial_decay,  # Spatial decay rate
-                            d=guard_agent_dist  # Distance to guard
+                            d=guard_distances  # Distance to guard
                         )
             
             #print("Running Ring Attractor Model...")
